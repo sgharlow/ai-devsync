@@ -1,0 +1,193 @@
+name: devsync heartbeat
+
+# Opens an issue when devsync stops syncing -- on every machine at once, or on one
+# machine while the others carry on. Installed into your STORE repository by
+# `devsync monitor install`. The measurement lives in .github/heartbeat_check.py;
+# this file only schedules it and manages the issues.
+#
+# It runs on a hosted runner on purpose. The condition being detected is "a machine
+# is not syncing", so the check cannot live on one of the machines.
+#
+# Rehearse the alert before you rely on it (use -1, not 0: a sync that just landed
+# is 0 hours old and 0 > 0 is false, so a drill at 0 passes while looking healthy):
+#
+#   gh workflow run sync-heartbeat.yml -f threshold_hours=-1
+#   gh workflow run sync-heartbeat.yml -f machine_threshold_hours=-1
+#
+# The next healthy run closes what the drill opened.
+#
+# Known limit: GitHub disables scheduled workflows in a repository with no activity
+# for 60 days. Sync commits are that activity, so a total outage longer than that
+# would eventually silence this check too. It fires long before then.
+
+on:
+  schedule:
+    - cron: '0 15 * * *'        # daily, 15:00 UTC
+  workflow_dispatch:
+    inputs:
+      threshold_hours:
+        description: 'Hours with no sync from ANY machine. -1 forces the alert.'
+        required: false
+        default: '48'
+      machine_threshold_hours:
+        description: 'Hours with no sync from ONE machine. -1 forces the alert.'
+        required: false
+        default: '72'
+
+concurrency:
+  group: sync-heartbeat
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  LABEL: devsync-heartbeat
+  GLOBAL_TITLE: 'devsync heartbeat lost: no machine has synced within the threshold'
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the check reads commit subjects across all history
+
+      - name: Measure sync freshness
+        id: heartbeat
+        run: >
+          python3 .github/heartbeat_check.py
+          --threshold "${{ inputs.threshold_hours || '48' }}"
+          --machine-threshold "${{ inputs.machine_threshold_hours || '72' }}"
+
+      - name: Make sure the label exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh label create "$LABEL" --color B60205 --description "devsync stopped syncing" --force
+
+      - name: Open or update the global alert
+        if: steps.heartbeat.outputs.stale == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGE: ${{ steps.heartbeat.outputs.age_hours }}
+          LAST: ${{ steps.heartbeat.outputs.last_iso }}
+          THRESHOLD: ${{ steps.heartbeat.outputs.threshold }}
+          PER_MACHINE: ${{ steps.heartbeat.outputs.per_machine }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          {
+            echo "No machine has pushed a sync commit to this store within the threshold."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Last sync commit | \`$LAST\` |"
+            echo "| Age | **${AGE}h** |"
+            echo "| Threshold | ${THRESHOLD}h |"
+            echo "| Detected by | [this run]($RUN_URL) |"
+            echo
+            echo "$PER_MACHINE"
+            echo
+            echo "While this is open, your machines are drifting apart. Nothing is lost"
+            echo "(devsync never deletes by inference), but merges pile up for the next sync."
+            echo
+            echo "Check, in order:"
+            echo
+            echo "1. Run \`devsync sync\` on each machine, then \`devsync status\` should show ahead 0, behind 0."
+            echo "2. Is the scheduled task or timer still installed, and does \`~/.devsync/sync.log\` show recent lines?"
+            echo "3. \`devsync conflicts\`: an unresolved conflict withholds the push."
+            echo "4. Are the machines simply off? The table shows which ones went quiet."
+            echo
+            echo "This issue closes itself on the next check that sees a fresh sync."
+          } > body.md
+          existing="$(gh issue list --state open --label "$LABEL" --json number,title \
+            --jq "[.[] | select(.title == \"$GLOBAL_TITLE\") | .number] | first // empty")"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file body.md
+          else
+            gh issue create --title "$GLOBAL_TITLE" --label "$LABEL" --body-file body.md
+          fi
+
+      - name: Close the global alert when syncing resumes
+        if: steps.heartbeat.outputs.stale == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGE: ${{ steps.heartbeat.outputs.age_hours }}
+          LAST: ${{ steps.heartbeat.outputs.last_iso }}
+        run: |
+          set -euo pipefail
+          existing="$(gh issue list --state open --label "$LABEL" --json number,title \
+            --jq "[.[] | select(.title == \"$GLOBAL_TITLE\") | .number] | first // empty")"
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --comment "Syncing resumed: last sync \`$LAST\` (${AGE}h ago)."
+          fi
+
+      # One issue per machine, keyed on its name, so one PC going quiet never hides
+      # behind another that is still syncing.
+      - name: Open or update per-machine alerts
+        if: steps.heartbeat.outputs.stale_machines != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STALE: ${{ steps.heartbeat.outputs.stale_machines }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          for entry in $STALE; do
+            m="${entry%%:*}"; rest="${entry#*:}"
+            age="${rest%%:*}"; rest="${rest#*:}"
+            thresh="${rest%%:*}"; last="${rest#*:}"
+            title="devsync: $m has stopped syncing"
+            {
+              echo "\`$m\` has not pushed a sync commit within its threshold."
+              echo
+              echo "| | |"
+              echo "|---|---|"
+              echo "| Machine | \`$m\` |"
+              echo "| Last sync | \`$last\` |"
+              echo "| Silent for | **${age}h** |"
+              echo "| Threshold | ${thresh}h |"
+              echo "| Detected by | [this run]($RUN_URL) |"
+              echo
+              echo "Check, in order:"
+              echo
+              echo "1. Is the machine on and online? Off, asleep or travelling is the benign explanation."
+              echo "2. Run \`devsync sync\` there; \`devsync status\` should then show ahead 0, behind 0."
+              echo "3. \`devsync conflicts\`: an unresolved conflict withholds the push."
+              echo "4. Gone for good? Add it to \`.github/heartbeat-machines.json\`: \`{ \"retired\": [\"$m\"] }\`."
+              echo
+              echo "Closes itself on the next run that sees \`$m\` sync."
+            } > body.md
+            existing="$(gh issue list --state open --label "$LABEL" --json number,title \
+              --jq "[.[] | select(.title == \"$title\") | .number] | first // empty")"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body-file body.md
+            else
+              gh issue create --title "$title" --label "$LABEL" --body-file body.md
+            fi
+          done
+
+      - name: Close per-machine alerts when a machine resumes
+        if: steps.heartbeat.outputs.fresh_machines != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FRESH: ${{ steps.heartbeat.outputs.fresh_machines }}
+        run: |
+          set -euo pipefail
+          for entry in $FRESH; do
+            m="${entry%%:*}"; rest="${entry#*:}"
+            age="${rest%%:*}"; last="${rest#*:}"
+            title="devsync: $m has stopped syncing"
+            existing="$(gh issue list --state open --label "$LABEL" --json number,title \
+              --jq "[.[] | select(.title == \"$title\") | .number] | first // empty")"
+            if [ -n "$existing" ]; then
+              gh issue close "$existing" --comment "\`$m\` resumed syncing: last sync \`$last\` (${age}h ago)."
+            fi
+          done
+
+      - name: Fail the run when anything is stale
+        if: steps.heartbeat.outputs.stale == 'true' || steps.heartbeat.outputs.stale_machines != ''
+        run: |
+          echo "::error::devsync heartbeat is stale; see the open issues labelled $LABEL."
+          exit 1

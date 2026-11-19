@@ -1,0 +1,43 @@
+name: tests
+
+# The suite on every OS devsync claims to run on. macOS is here because nobody
+# on the project runs it day to day: this job is the only evidence it works.
+on:
+  push:
+    branches: [main, "feat/**", "fix/**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[test]"
+      - run: python -m pytest tests -q -rs
+
+  # A stranger's first hour: install with pipx into an empty environment and follow
+  # the README step by step across several simulated PCs. Catches what unit tests
+  # cannot -- a wrong install line, a command that is not on PATH, a missing default.
+  fresh-install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install pipx
+      - run: sh tests/fresh_install.sh
+        env:
+          DEVSYNC_INSTALL_SPEC: ${{ github.workspace }}
+          WALK_ROOT: ${{ runner.temp }}/devsync-walk
+          PIPX_HOME: ${{ runner.temp }}/pipx
+          PIPX_BIN_DIR: ${{ runner.temp }}/pipx-bin

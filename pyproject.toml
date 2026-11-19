@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-devsync"
+version = "0.2.0"
+readme = "README.md"
+license = { text = "MIT" }
+description = "Merge-based sync of AI coding-agent config, memory and gitignored files across machines"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+# Only needed for an encrypted store. An unencrypted store never imports it.
+encrypt = ["cryptography>=42"]
+test = ["pytest>=7", "cryptography>=42"]
+
+[project.scripts]
+devsync = "devsync.cli:main"
+ai-devsync = "devsync.cli:main"
+
+[tool.setuptools]
+packages = ["devsync"]
+
+[tool.setuptools.package-data]
+# The store-side monitor that `devsync monitor install` copies into a store repo.
+devsync = ["templates/store/.github/*.py", "templates/store/.github/workflows/*.yml"]
